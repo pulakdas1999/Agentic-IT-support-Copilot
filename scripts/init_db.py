@@ -1,20 +1,43 @@
 import os
+import json
 from langchain_core.documents import Document
-from langchain_google_genai import GoogleGenAIEmbeddings
-from langchain_community.vectorstores import Qdrant
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain_qdrant import QdrantVectorStore
+
+def load_local_settings_keys():
+    """Automatically extracts the Gemini API Key from local.settings.json"""
+    base_dir = os.path.dirname(os.path.dirname(__file__))
+    settings_path = os.path.join(base_dir, "local.settings.json")
+    
+    if not os.path.exists(settings_path):
+        raise FileNotFoundError(f"Could not locate local.settings.json at {settings_path}")
+        
+    with open(settings_path, "r") as f:
+        data = json.load(f)
+        
+    values = data.get("Values", {})
+    api_key = values.get("GEMINI_API_KEY")
+    
+    if not api_key or "YourActual" in api_key:
+        raise ValueError("GEMINI_API_KEY inside local.settings.json is empty or contains placeholder text!")
+        
+    print("--- SUCCESS: Loaded GEMINI_API_KEY from local.settings.json ---")
+    return api_key
 
 def initialize_and_seed_db():
     print("--- STARTING LOCAL DATABASE SEEDING ---")
     
-    # Fetch API Key from environment variable
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key or "YourActual" in api_key:
-        raise ValueError("Please export a valid GEMINI_API_KEY in your terminal session first!")
+    # 1. Load the api key string explicitly from file
+    gemini_key = load_local_settings_keys()
 
-    # Using Google's native text embedding model
-    embeddings = GoogleGenAIEmbeddings(model="models/text-embedding-004", google_api_key=api_key)
+    # Ensure it includes the "models/" prefix and matching model identifier number
+    embeddings = GoogleGenerativeAIEmbeddings(
+        model="models/gemini-embedding-001",
+        google_api_key=gemini_key
+    )
 
-    # Simulated enterprise knowledge base
+
+    # 3. Simulated enterprise knowledge base records
     seed_data = [
         Document(
             page_content="EY internal VPN configuration requires the GlobalProtect Client v5.2. Multi-factor authentication (MFA) must be completed using the Microsoft Authenticator app connected to your corporate ID.", 
@@ -30,12 +53,11 @@ def initialize_and_seed_db():
         )
     ]
 
-    # Initialize Qdrant completely locally inside a simple storage directory
+    # 4. Initialize Qdrant completely locally inside your clean workspace folder tree
     db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "local_qdrant_storage")
+    print(f"Compiling offline persistent database vector index files inside: {db_path}")
     
-    print(f"Creating offline persistent database vector storage inside: {db_path}")
-    
-    vector_store = Qdrant.from_documents(
+    vector_store = QdrantVectorStore.from_documents(
         documents=seed_data,
         embedding=embeddings,
         path=db_path,

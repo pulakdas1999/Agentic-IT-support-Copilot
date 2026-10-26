@@ -1,10 +1,33 @@
 import os
+import json
 from typing import List, TypedDict, Literal
 from pydantic import BaseModel, Field
 from langchain_core.documents import Document
-from langchain_google_genai import GoogleGenAIEmbeddings, ChatGoogleGenerativeAI
-from langchain_community.vectorstores import Qdrant
+from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
+from langchain_qdrant import QdrantVectorStore
 from langgraph.graph import StateGraph, START, END
+from qdrant_client import QdrantClient
+from langchain_qdrant import QdrantVectorStore
+
+def load_local_settings_keys():
+    """Automatically extracts the Gemini API Key from local.settings.json"""
+    base_dir = os.path.dirname(os.path.dirname(__file__))
+    settings_path = os.path.join(base_dir, "local.settings.json")
+    
+    if not os.path.exists(settings_path):
+        raise FileNotFoundError(f"Could not locate local.settings.json at {settings_path}")
+        
+    with open(settings_path, "r") as f:
+        data = json.load(f)
+        
+    values = data.get("Values", {})
+    api_key = values.get("GEMINI_API_KEY")
+    
+    if not api_key or "YourActual" in api_key:
+        raise ValueError("GEMINI_API_KEY inside local.settings.json is empty or contains placeholder text!")
+        
+    print("--- SUCCESS: Loaded GEMINI_API_KEY from local.settings.json ---")
+    return api_key
 
 # Define state machine memory schema
 class AgentState(TypedDict):
@@ -22,17 +45,21 @@ class RouterSchema(BaseModel):
 def build_workflow_graph():
     api_key = os.getenv("GEMINI_API_KEY")
     
-    # 1. Connect to the local file database initialized by our script
     base_dir = os.path.dirname(os.path.dirname(__file__))
     db_path = os.path.join(base_dir, "local_qdrant_storage")
     
-    embeddings = GoogleGenAIEmbeddings(model="models/text-embedding-004", google_api_key=api_key)
+    # MATCH THE INITIALIZATION FALLBACK STRIP
+    embeddings = GoogleGenerativeAIEmbeddings(
+        model="models/embedding-001", 
+        google_api_key=api_key
+    )
     
-    vector_store = Qdrant(
-        client=None, # Client is derived via path configuration below
-        path=db_path,
-        collection_name="ey_internal_docs",
-        embeddings=embeddings
+    client = QdrantClient(path=db_path)
+
+    vector_store = QdrantVectorStore(
+        client=client,
+        embedding=embeddings,
+        collection_name="ey_internal_docs"
     )
     retriever = vector_store.as_retriever(search_kwargs={"k": 2})
 
