@@ -1,71 +1,82 @@
 import os
 import json
-from langchain_core.documents import Document
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
-from langchain_qdrant import QdrantVectorStore
+from qdrant_client import QdrantClient
+from qdrant_client.models import VectorParams, Distance
+
 
 def load_local_settings_keys():
-    """Automatically extracts the Gemini API Key from local.settings.json"""
+    """Automatically extracts the Gemini API Key, embedding model, and
+    Qdrant collection name from local.settings.json"""
     base_dir = os.path.dirname(os.path.dirname(__file__))
     settings_path = os.path.join(base_dir, "local.settings.json")
-    
+
     if not os.path.exists(settings_path):
         raise FileNotFoundError(f"Could not locate local.settings.json at {settings_path}")
-        
+
     with open(settings_path, "r") as f:
         data = json.load(f)
-        
+
     values = data.get("Values", {})
     api_key = values.get("GEMINI_API_KEY")
     model_name = values.get("GEMINI_EMB_MODEL")
-    
+    collection_name = values.get("QDRANT_COLLECTION_NAME")
+
     if not api_key or "YourActual" in api_key:
         raise ValueError("GEMINI_API_KEY inside local.settings.json is empty or contains placeholder text!")
-        
-    print("--- SUCCESS: Loaded GEMINI_API_KEY from local.settings.json ---")
-    return api_key, model_name
 
-def initialize_and_seed_db():
-    print("--- STARTING LOCAL DATABASE SEEDING ---")
-    
-    # 1. Load the api key string explicitly from file
-    gemini_key, model_name = load_local_settings_keys()
+    if not model_name:
+        raise ValueError("GEMINI_EMB_MODEL is missing from local.settings.json")
 
-    # Ensure it includes the "models/" prefix and matching model identifier number
+    if not collection_name:
+        raise ValueError(
+            "QDRANT_COLLECTION_NAME is missing from local.settings.json. "
+            "Add it under Values, e.g. \"QDRANT_COLLECTION_NAME\": \"knowledge_base\""
+        )
+
+    print("--- SUCCESS: Loaded GEMINI_API_KEY, GEMINI_EMB_MODEL, and QDRANT_COLLECTION_NAME ---")
+    return api_key, model_name, collection_name
+
+
+def initialize_db():
+    print("--- STARTING LOCAL DATABASE INITIALIZATION ---")
+
+    gemini_key, model_name, collection_name = load_local_settings_keys()
+
     embeddings = GoogleGenerativeAIEmbeddings(
         model=model_name,
         google_api_key=gemini_key
     )
 
+    # Qdrant needs to know the vector dimension up front to create a
+    # collection. Rather than hardcoding a number that could go stale if
+    # the embedding model is ever swapped, we embed one throwaway string
+    # purely to learn the dimension. Nothing from this call is stored.
+    print("Determining embedding dimension from the configured model...")
+    probe_vector = embeddings.embed_query("dimension probe - not stored")
+    vector_size = len(probe_vector)
+    print(f"Embedding model '{model_name}' produces {vector_size}-dimensional vectors.")
 
-    # 3. Simulated enterprise knowledge base records
-    seed_data = [
-        Document(
-            page_content="EY internal VPN configuration requires the GlobalProtect Client v5.2. Multi-factor authentication (MFA) must be completed using the Microsoft Authenticator app connected to your corporate ID.", 
-            metadata={"category": "IT_Infrastructure", "severity": "High"}
-        ),
-        Document(
-            page_content="To request a new corporate laptop hardware upgrade, employees must submit an asset allocation ticket via the Talent Marketplace portal after completing 24 months of continuous service.", 
-            metadata={"category": "HR_Hardware", "severity": "Low"}
-        ),
-        Document(
-            page_content="Password policy rules: EY domain passwords expire every 90 days. New passwords must contain at least 14 characters, including special symbols, and cannot match the last 5 passwords used.", 
-            metadata={"category": "Security_Policy", "severity": "Critical"}
-        )
-    ]
+    base_dir = os.path.dirname(os.path.dirname(__file__))
+    db_path = os.path.join(base_dir, "local_qdrant_storage")
+    print(f"Initializing offline persistent vector index files inside: {db_path}")
 
-    # 4. Initialize Qdrant completely locally inside your clean workspace folder tree
-    db_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "local_qdrant_storage")
-    print(f"Compiling offline persistent database vector index files inside: {db_path}")
-    
-    vector_store = QdrantVectorStore.from_documents(
-        documents=seed_data,
-        embedding=embeddings,
-        path=db_path,
-        collection_name="ey_internal_docs"
+    client = QdrantClient(path=db_path)
+
+    if client.collection_exists(collection_name):
+        print(f"--- Collection '{collection_name}' already exists. Nothing to do. ---")
+        print("If you want a completely fresh start, delete the local_qdrant_storage folder first.")
+        return
+
+    client.create_collection(
+        collection_name=collection_name,
+        vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE)
     )
-    
-    print("--- DATABASE SEEDED SUCCESSFULLY WITH 3 ENTERPRISE RECORDS ---")
+
+    print(f"--- DATABASE INITIALIZED: empty collection '{collection_name}' created ---")
+    print("No documents were added. Use the POST /api/documents endpoint (or the")
+    print("blob ingestion script) to populate it.")
+
 
 if __name__ == "__main__":
-    initialize_and_seed_db()
+    initialize_db()

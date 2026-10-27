@@ -6,24 +6,48 @@ from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGener
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
 
+
 class AgentState(TypedDict):
     question: str
     documents: List[Document]
     generation: str
     route_choice: str
-    
+
+
+# Structured validation schema for the routing decision.
+# Pydantic forces the model's routing output into a strict literal
+# instead of free-form text we'd have to parse ourselves.
 class RouterSchema(BaseModel):
     datasource: Literal["vectorstore", "fallback"] = Field(
-        description="Route to 'vectorstore' if query relates to corporate operations, IT, VPN, or hardware. Otherwise route to 'fallback'."
+        description="Route to 'vectorstore' if the query could plausibly be answered using the indexed knowledge base. Otherwise route to 'fallback'."
     )
 
-class ITSupportAgent:
+
+class KnowledgeBaseAgent:
+    """
+    Domain-agnostic RAG agent: determine_route -> either
+    (retrieve_docs -> generate_answer) or execute_fallback.
+
+    Works against whatever is stored in the configured Qdrant collection -
+    no assumptions are made here about what kind of documents it holds
+    (IT policies, research papers, or anything else).
+    """
+
     def __init__(self):
         api_key = os.getenv("GEMINI_API_KEY")
         model_name = os.getenv("GEMINI_EMB_MODEL")
+        collection_name = os.getenv("QDRANT_COLLECTION_NAME")
         base_dir = os.path.dirname(os.path.dirname(__file__))
         db_path = os.path.join(base_dir, "local_qdrant_storage")
 
+        if not collection_name:
+            raise ValueError(
+                "QDRANT_COLLECTION_NAME is missing from local.settings.json. "
+                "It must match the name used when the collection was created via scripts/init_db.py."
+            )
+
+        # NOTE: this MUST match the model used in scripts/init_db.py exactly,
+        # or retrieval will silently break (dimension mismatch / garbage results).
         self.embeddings = GoogleGenerativeAIEmbeddings(
             model=model_name,
             google_api_key=api_key
@@ -34,19 +58,24 @@ class ITSupportAgent:
         self.vector_store = QdrantVectorStore(
             client=self.client,
             embedding=self.embeddings,
-            collection_name="ey_internal_docs"
+            collection_name=collection_name
         )
-        self.retriever = self.vector_store.as_retriever(search_kwargs={"k": 2})
+        self.retriever = self.vector_store.as_retriever(search_kwargs={"k": 4})
 
         self.llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=api_key, temperature=0)
         self.structured_router = self.llm.with_structured_output(RouterSchema)
 
     def determine_route(self, question: str) -> str:
-        system_prompt = f"Analyze this enterprise user query: '{question}' and decide its destination data stack."
+        system_prompt = (
+            f"Analyze this user query: '{question}' and decide whether it could plausibly "
+            f"be answered using documents in a knowledge base, or whether it's unrelated/general "
+            f"and should fall back to a default response."
+        )
         try:
             decision = self.structured_router.invoke(system_prompt)
             return decision.datasource
         except Exception:
+            # Fallback gracefully if model/serialization stumbles
             return "fallback"
 
     def retrieve_docs(self, question: str) -> List[Document]:
@@ -54,19 +83,21 @@ class ITSupportAgent:
 
     def generate_answer(self, question: str, docs: List[Document]) -> str:
         if not docs:
-            return "FALLBACK_TRIGGERED: No relevant local documents met the certainty filter."
+            return "FALLBACK_TRIGGERED: No relevant documents met the retrieval threshold."
 
         context = "\n\n".join([d.page_content for d in docs])
         prompt = (
-            f"You are an EY support assistant. Answer the user query using ONLY the provided verified context.\n"
+            f"You are a knowledge-base assistant. Answer the user's question using ONLY "
+            f"the provided context below. If the context does not contain enough information "
+            f"to answer confidently, say so explicitly rather than guessing.\n\n"
             f"User Question: {question}\n\n"
-            f"Verified Enterprise Context:\n{context}"
+            f"Retrieved Context:\n{context}"
         )
         response = self.llm.invoke(prompt)
         return response.content
 
     def execute_fallback(self) -> str:
-        return "FALLBACK_TRIGGERED: Query details not found in local internal corporate records. Ticket routed to the live IT Support queue."
+        return "FALLBACK_TRIGGERED: No matching information was found in the knowledge base for this query."
 
     def run(self, question: str) -> AgentState:
         route_choice = self.determine_route(question)
@@ -85,9 +116,17 @@ class ITSupportAgent:
             "route_choice": route_choice,
         }
 
+
+# --- Cached agent instance ---
+# Qdrant's embedded (path=) mode takes an exclusive file lock on db_path.
+# Building a new QdrantClient on every HTTP request risks "storage folder
+# already accessed by another instance" errors once concurrent/sequential
+# requests overlap. Build the agent once and reuse it.
 _agent_cache = None
-def get_agent() -> ITSupportAgent:
+
+
+def get_agent() -> KnowledgeBaseAgent:
     global _agent_cache
     if _agent_cache is None:
-        _agent_cache = ITSupportAgent()
+        _agent_cache = KnowledgeBaseAgent()
     return _agent_cache
