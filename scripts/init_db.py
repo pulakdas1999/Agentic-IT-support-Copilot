@@ -17,22 +17,23 @@ def load_local_settings_keys():
         
     values = data.get("Values", {})
     api_key = values.get("GEMINI_API_KEY")
+    model_name = values.get("GEMINI_EMB_MODEL")
     
     if not api_key or "YourActual" in api_key:
         raise ValueError("GEMINI_API_KEY inside local.settings.json is empty or contains placeholder text!")
         
     print("--- SUCCESS: Loaded GEMINI_API_KEY from local.settings.json ---")
-    return api_key
+    return api_key, model_name
 
 def initialize_and_seed_db():
     print("--- STARTING LOCAL DATABASE SEEDING ---")
     
     # 1. Load the api key string explicitly from file
-    gemini_key = load_local_settings_keys()
+    gemini_key, model_name = load_local_settings_keys()
 
     # Ensure it includes the "models/" prefix and matching model identifier number
     embeddings = GoogleGenerativeAIEmbeddings(
-        model="models/gemini-embedding-001",
+        model=model_name,
         google_api_key=gemini_key
     )
 
