@@ -5,5 +5,12 @@
     "reason": "routed_as_unrelated",
     "status": "Open",
     "created_at": "2026-10-29T11:25:42.610431+00:00"
+  },
+  {
+    "ticket_id": "TKT-A6846BA7",
+    "question": "Explain me why should i go to school?",
+    "reason": "routed_as_unrelated",
+    "status": "Open",
+    "created_at": "2026-10-29T11:38:32.142452+00:00"
   }
 ]

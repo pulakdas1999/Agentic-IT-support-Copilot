@@ -53,7 +53,8 @@ def query(req: func.HttpRequest) -> func.HttpResponse:
             "routed_through": final_output.get("route_choice", "direct_step"),
             "documents_matched": len(final_output.get("documents", [])),
             "answer": final_output.get("generation"),
-            "ticket_id": final_output.get("ticket_id")
+            "ticket_id": final_output.get("ticket_id"),
+            "sources": final_output.get("sources", [])
         }
 
         return func.HttpResponse(
@@ -452,10 +453,7 @@ def delete_document_by_source(req: func.HttpRequest) -> func.HttpResponse:
 def view_tickets(req: func.HttpRequest) -> func.HttpResponse:
     """
     Lists every ticket created by the fallback flow, or looks up one
-    specific ticket if ?ticket_id=... is passed. This is purely for local
-    testing - a stand-in for logging into a real ServiceNow/Jira instance
-    to confirm the escalation path actually fired and captured the
-    right question.
+    specific ticket if ?ticket_id=... is passed.
 
     Usage:
         GET /api/tickets                      -> list all tickets

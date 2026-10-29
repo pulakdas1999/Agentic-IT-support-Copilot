@@ -14,6 +14,7 @@ class AgentState(TypedDict):
     generation: str
     route_choice: str
     ticket_id: Optional[str]
+    sources: List[dict]
 
 
 # Structured validation schema for the routing decision.
@@ -23,6 +24,12 @@ class RouterSchema(BaseModel):
     datasource: Literal["vectorstore", "fallback"] = Field(
         description="Route to 'vectorstore' if the query could plausibly be answered using the indexed knowledge base. Otherwise route to 'fallback'."
     )
+
+
+# How much of each chunk's text to include in the "sources" excerpt
+# returned to the caller. This is just a preview for display purposes -
+# the full chunk text is still what's sent to the LLM for generation.
+SOURCE_EXCERPT_LENGTH = 200
 
 
 class KnowledgeBaseAgent:
@@ -38,6 +45,11 @@ class KnowledgeBaseAgent:
     unrelated, or routed correctly but nothing relevant was retrieved),
     a support ticket is automatically created via core.ticketing so the
     question doesn't just disappear into a dead-end response.
+
+    When an answer IS generated, every retrieved chunk's source metadata
+    is returned alongside it (see `sources` in the result), so the caller
+    can show exactly which document(s) and chunk(s) backed the answer -
+    the answer is never just taken on faith.
     """
 
     def __init__(self):
@@ -88,45 +100,85 @@ class KnowledgeBaseAgent:
     def retrieve_docs(self, question: str) -> List[Document]:
         return self.retriever.invoke(question)
 
-    def generate_answer(self, question: str, docs: List[Document]) -> Tuple[str, Optional[str]]:
-        """Returns (answer_text, ticket_id_or_none)."""
+    def _build_sources(self, docs: List[Document]) -> List[dict]:
+        """
+        One entry per retrieved chunk, in the same order they were
+        numbered in the prompt sent to the LLM (source_number matches the
+        [N] markers the model was asked to cite with).
+        """
+        sources = []
+        for idx, doc in enumerate(docs, start=1):
+            meta = doc.metadata or {}
+            excerpt = doc.page_content[:SOURCE_EXCERPT_LENGTH]
+            if len(doc.page_content) > SOURCE_EXCERPT_LENGTH:
+                excerpt += "..."
+
+            sources.append({
+                "source_number": idx,
+                "source_filename": meta.get("source_filename", "unknown"),
+                "category": meta.get("category"),
+                "chunk_index": meta.get("chunk_index"),
+                "total_chunks": meta.get("total_chunks"),
+                "excerpt": excerpt,
+            })
+        return sources
+
+    def generate_answer(self, question: str, docs: List[Document]) -> Tuple[str, Optional[str], List[dict]]:
+        """Returns (answer_text, ticket_id_or_none, sources)."""
         if not docs:
             ticket = create_ticket(question, reason="no_relevant_documents")
             answer = (
                 f"FALLBACK_TRIGGERED: No relevant documents met the retrieval threshold. "
                 f"A ticket has been created for follow-up: {ticket['ticket_id']}"
             )
-            return answer, ticket["ticket_id"]
+            return answer, ticket["ticket_id"], []
 
-        context = "\n\n".join([d.page_content for d in docs])
+        sources = self._build_sources(docs)
+
+        # Each chunk is numbered to match its entry in `sources`, so the
+        # model CAN cite inline with [1], [2], etc. if it chooses to -
+        # this isn't enforced/parsed, it's just encouraged, since the
+        # structured `sources` list is returned regardless either way.
+        context_blocks = []
+        for src in sources:
+            doc = docs[src["source_number"] - 1]
+            context_blocks.append(
+                f"[{src['source_number']}] (source: {src['source_filename']}, "
+                f"chunk {src['chunk_index']})\n{doc.page_content}"
+            )
+        context = "\n\n".join(context_blocks)
+
         prompt = (
             f"You are a knowledge-base assistant. Answer the user's question using ONLY "
-            f"the provided context below. If the context does not contain enough information "
-            f"to answer confidently, say so explicitly rather than guessing.\n\n"
+            f"the provided context below. Each context block is labeled with a number in "
+            f"square brackets, e.g. [1]. Where it's natural to do so, cite the source "
+            f"number(s) your answer draws from inline, like this: \"...as described in "
+            f"[1].\" If the context does not contain enough information to answer "
+            f"confidently, say so explicitly rather than guessing.\n\n"
             f"User Question: {question}\n\n"
             f"Retrieved Context:\n{context}"
         )
         response = self.llm.invoke(prompt)
-        return response.content, None
+        return response.content, None, sources
 
-    def execute_fallback(self, question: str) -> Tuple[str, str]:
-        """Returns (answer_text, ticket_id)."""
+    def execute_fallback(self, question: str) -> Tuple[str, str, List[dict]]:
+        """Returns (answer_text, ticket_id, sources)."""
         ticket = create_ticket(question, reason="routed_as_unrelated")
         answer = (
             f"FALLBACK_TRIGGERED: No matching information was found in the knowledge base "
             f"for this query. A ticket has been created for follow-up: {ticket['ticket_id']}"
         )
-        return answer, ticket["ticket_id"]
+        return answer, ticket["ticket_id"], []
 
     def run(self, question: str) -> AgentState:
         route_choice = self.determine_route(question)
 
         if route_choice == "vectorstore":
             docs = self.retrieve_docs(question)
-            generation, ticket_id = self.generate_answer(question, docs)
+            generation, ticket_id, sources = self.generate_answer(question, docs)
         else:
             docs = []
-            generation, ticket_id = self.execute_fallback(question)
+            generation, ticket_id, sources = self.execute_fallback(question)
 
         return {
             "question": question,
@@ -134,6 +186,7 @@ class KnowledgeBaseAgent:
             "generation": generation,
             "route_choice": route_choice,
             "ticket_id": ticket_id,
+            "sources": sources,
         }
 
 
