@@ -6,6 +6,7 @@ import hashlib
 import logging
 import random
 from core.rag_agent import get_agent
+from core.ticketing import get_ticket, list_tickets
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from qdrant_client.models import Filter, FieldCondition, MatchValue
@@ -51,7 +52,8 @@ def query(req: func.HttpRequest) -> func.HttpResponse:
             "status": "Success",
             "routed_through": final_output.get("route_choice", "direct_step"),
             "documents_matched": len(final_output.get("documents", [])),
-            "answer": final_output.get("generation")
+            "answer": final_output.get("generation"),
+            "ticket_id": final_output.get("ticket_id")
         }
 
         return func.HttpResponse(
@@ -441,6 +443,53 @@ def delete_document_by_source(req: func.HttpRequest) -> func.HttpResponse:
         logging.error(f"Failed to delete document by source: {str(e)}")
         return func.HttpResponse(
             json.dumps({"error": "Failed to delete document"}),
+            status_code=500,
+            mimetype="application/json"
+        )
+
+
+@bp.route(route="tickets", methods=["GET"])
+def view_tickets(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Lists every ticket created by the fallback flow, or looks up one
+    specific ticket if ?ticket_id=... is passed. This is purely for local
+    testing - a stand-in for logging into a real ServiceNow/Jira instance
+    to confirm the escalation path actually fired and captured the
+    right question.
+
+    Usage:
+        GET /api/tickets                      -> list all tickets
+        GET /api/tickets?ticket_id=TKT-XXXXXX  -> view one ticket
+    """
+    logging.info("Viewing ticket(s).")
+    try:
+        ticket_id = req.params.get("ticket_id")
+
+        if ticket_id:
+            ticket = get_ticket(ticket_id)
+            if ticket is None:
+                return func.HttpResponse(
+                    json.dumps({"error": f"No ticket found with id '{ticket_id}'"}),
+                    status_code=404,
+                    mimetype="application/json"
+                )
+            return func.HttpResponse(
+                json.dumps(ticket),
+                status_code=200,
+                mimetype="application/json"
+            )
+
+        all_tickets = list_tickets()
+        return func.HttpResponse(
+            json.dumps({"count": len(all_tickets), "tickets": all_tickets}),
+            status_code=200,
+            mimetype="application/json"
+        )
+
+    except Exception as e:
+        logging.error(f"Failed to retrieve ticket(s): {str(e)}")
+        return func.HttpResponse(
+            json.dumps({"error": "Failed to retrieve ticket(s)"}),
             status_code=500,
             mimetype="application/json"
         )

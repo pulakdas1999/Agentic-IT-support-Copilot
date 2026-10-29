@@ -1,10 +1,11 @@
 import os
-from typing import List, TypedDict, Literal
+from typing import List, TypedDict, Literal, Optional, Tuple
 from pydantic import BaseModel, Field
 from langchain_core.documents import Document
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
+from core.ticketing import create_ticket
 
 
 class AgentState(TypedDict):
@@ -12,6 +13,7 @@ class AgentState(TypedDict):
     documents: List[Document]
     generation: str
     route_choice: str
+    ticket_id: Optional[str]
 
 
 # Structured validation schema for the routing decision.
@@ -31,6 +33,11 @@ class KnowledgeBaseAgent:
     Works against whatever is stored in the configured Qdrant collection -
     no assumptions are made here about what kind of documents it holds
     (IT policies, research papers, or anything else).
+
+    Whenever neither path produces a usable answer (query routed as
+    unrelated, or routed correctly but nothing relevant was retrieved),
+    a support ticket is automatically created via core.ticketing so the
+    question doesn't just disappear into a dead-end response.
     """
 
     def __init__(self):
@@ -81,9 +88,15 @@ class KnowledgeBaseAgent:
     def retrieve_docs(self, question: str) -> List[Document]:
         return self.retriever.invoke(question)
 
-    def generate_answer(self, question: str, docs: List[Document]) -> str:
+    def generate_answer(self, question: str, docs: List[Document]) -> Tuple[str, Optional[str]]:
+        """Returns (answer_text, ticket_id_or_none)."""
         if not docs:
-            return "FALLBACK_TRIGGERED: No relevant documents met the retrieval threshold."
+            ticket = create_ticket(question, reason="no_relevant_documents")
+            answer = (
+                f"FALLBACK_TRIGGERED: No relevant documents met the retrieval threshold. "
+                f"A ticket has been created for follow-up: {ticket['ticket_id']}"
+            )
+            return answer, ticket["ticket_id"]
 
         context = "\n\n".join([d.page_content for d in docs])
         prompt = (
@@ -94,26 +107,33 @@ class KnowledgeBaseAgent:
             f"Retrieved Context:\n{context}"
         )
         response = self.llm.invoke(prompt)
-        return response.content
+        return response.content, None
 
-    def execute_fallback(self) -> str:
-        return "FALLBACK_TRIGGERED: No matching information was found in the knowledge base for this query."
+    def execute_fallback(self, question: str) -> Tuple[str, str]:
+        """Returns (answer_text, ticket_id)."""
+        ticket = create_ticket(question, reason="routed_as_unrelated")
+        answer = (
+            f"FALLBACK_TRIGGERED: No matching information was found in the knowledge base "
+            f"for this query. A ticket has been created for follow-up: {ticket['ticket_id']}"
+        )
+        return answer, ticket["ticket_id"]
 
     def run(self, question: str) -> AgentState:
         route_choice = self.determine_route(question)
 
         if route_choice == "vectorstore":
             docs = self.retrieve_docs(question)
-            generation = self.generate_answer(question, docs)
+            generation, ticket_id = self.generate_answer(question, docs)
         else:
             docs = []
-            generation = self.execute_fallback()
+            generation, ticket_id = self.execute_fallback(question)
 
         return {
             "question": question,
             "documents": docs,
             "generation": generation,
             "route_choice": route_choice,
+            "ticket_id": ticket_id,
         }
 
 
